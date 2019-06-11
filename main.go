@@ -69,6 +69,8 @@ func listen(addr string, port int, lineChan chan *bytes.Buffer) {
 func handleLog(conn net.Conn, lineChan chan *bytes.Buffer) {
 	defer conn.Close()
 	scanner := bufio.NewScanner(conn)
+	buf := make([]byte, 0, bufferSize)
+	scanner.Buffer(buf, 1024*1024)
 	for scanner.Scan() {
 		buf := scanner.Bytes()
 		outbuf := bufPool.Get().(*bytes.Buffer)
