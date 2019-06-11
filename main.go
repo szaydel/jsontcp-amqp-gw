@@ -116,7 +116,7 @@ func receive(lineChan chan *bytes.Buffer, serverInfo AMQPServer) error {
 	var b *bytes.Buffer
 	for {
 		b = <-lineChan
-		log.Printf("Publishing %s", string(b.Bytes()))
+		//log.Printf("Publishing %s", string(b.Bytes()))
 		if err = channel.Publish(
 			serverInfo.exchangeName, // publish to an exchange
 			serverInfo.routingKey,   // routing to 0 or more queues
