@@ -113,23 +113,10 @@ func receive(lineChan chan *bytes.Buffer, serverInfo AMQPServer) error {
 		return fmt.Errorf("Exchange Declare: %s", err)
 	}
 
-	// Reliable publisher confirms require confirm.select support from the
-	// connection.
-	if serverInfo.reliable {
-		log.Printf("enabling publishing confirms.")
-		if err := channel.Confirm(false); err != nil {
-			return fmt.Errorf("Channel could not be put into confirm mode: %s", err)
-		}
-
-		confirms := channel.NotifyPublish(make(chan amqp.Confirmation, 1))
-
-		defer confirmOne(confirms)
-	}
-
 	var b *bytes.Buffer
 	for {
 		b = <-lineChan
-		log.Printf("%v", b.Bytes())
+		log.Printf("Publishing %s", string(b.Bytes()))
 		if err = channel.Publish(
 			serverInfo.exchangeName, // publish to an exchange
 			serverInfo.routingKey,   // routing to 0 or more queues
@@ -142,7 +129,6 @@ func receive(lineChan chan *bytes.Buffer, serverInfo AMQPServer) error {
 				Body:            b.Bytes(),
 				DeliveryMode:    amqp.Transient, // 1=non-persistent, 2=persistent
 				Priority:        0,              // 0-9
-				// a bunch of application/implementation-specific fields
 			},
 		); err != nil {
 			return fmt.Errorf("Exchange Publish: %s", err)
@@ -156,19 +142,6 @@ func receive(lineChan chan *bytes.Buffer, serverInfo AMQPServer) error {
 	return nil
 }
 
-// One would typically keep a channel of publishings, a sequence number, and a
-// set of unacknowledged sequence numbers and loop until the publishing channel
-// is closed.
-func confirmOne(confirms <-chan amqp.Confirmation) {
-	log.Printf("waiting for confirmation of one publishing")
-
-	if confirmed := <-confirms; confirmed.Ack {
-		log.Printf("confirmed delivery with delivery tag: %d", confirmed.DeliveryTag)
-	} else {
-		log.Printf("failed delivery of delivery tag: %d", confirmed.DeliveryTag)
-	}
-}
-
 func main() {
 	var port int
 	var addr string
@@ -177,14 +150,13 @@ func main() {
 	flag.StringVar(&serverInfo.exchangeName, "exchange", "test-exchange", "Durable AMQP exchange name")
 	flag.StringVar(&serverInfo.exchangeType, "exchange-type", "direct", "Exchange type - direct|fanout|topic|x-custom")
 	flag.StringVar(&serverInfo.routingKey, "key", "test-key", "AMQP routing key")
-	flag.BoolVar(&serverInfo.reliable, "reliable", true, "Wait for the publisher confirmation before exiting")
 
 	flag.StringVar(&addr, "addr", "0.0.0.0", "Address to listen on")
 	flag.IntVar(&port, "port", 9000, "Port to listen on")
 	flag.Parse()
 
 	log.Printf("Publishing to %+v", serverInfo)
-	lineChan := make(chan *bytes.Buffer, 100)
+	lineChan := make(chan *bytes.Buffer, 1000)
 	go listen(addr, port, lineChan)
 
 	for {
