@@ -133,6 +133,7 @@ func receive(lineChan chan *bytes.Buffer, serverInfo AMQPServer) error {
 				Priority:        0,              // 0-9
 			},
 		); err != nil {
+			lineChan <- b
 			return fmt.Errorf("Exchange Publish: %s", err)
 		}
 
