@@ -13,14 +13,6 @@ import (
 	"github.com/streadway/amqp"
 )
 
-type AMQPServer struct {
-	uri          string
-	exchangeName string
-	exchangeType string
-	routingKey   string
-	reliable     bool
-}
-
 const bufferSize int = 128 * 1024
 
 var bufPool = sync.Pool{
@@ -84,86 +76,142 @@ func handleLog(conn net.Conn, lineChan chan *bytes.Buffer) {
 	log.Printf("Connection from %s closed", conn.RemoteAddr())
 }
 
-func receive(lineChan chan *bytes.Buffer, serverInfo AMQPServer) error {
-	// This function dials, connects, declares, publishes, and tears down,
-	// all in one go. In a real service, you probably want to maintain a
-	// long-lived connection as state, and publish against that.
+type AMQPServer struct {
+	uri          string
+	exchangeName string
+	exchangeType string
+	routingKey   string
+	reliable     bool
+	connection   *amqp.Connection
+	channel      *amqp.Channel
+	connected    bool
+}
 
-	log.Printf("dialing %q", serverInfo.uri)
-	connection, err := amqp.Dial(serverInfo.uri)
+func (s AMQPServer) String() string {
+	return fmt.Sprintf("uri=%s exchange=%s routingKey=%s", s.uri, s.exchangeName, s.routingKey)
+}
+func (s *AMQPServer) Connect() error {
+	// This function dials, connects, declares,
+	log.Printf("dialing %q", s.uri)
+	connection, err := amqp.Dial(s.uri)
 	if err != nil {
 		return fmt.Errorf("Dial: %s", err)
 	}
-	defer connection.Close()
 
 	log.Printf("got Connection, getting Channel")
 	channel, err := connection.Channel()
 	if err != nil {
+		connection.Close()
 		return fmt.Errorf("Channel: %s", err)
 	}
 
-	log.Printf("got Channel, declaring %q Exchange (%q)", serverInfo.exchangeType, serverInfo.exchangeName)
+	log.Printf("got Channel, declaring %q Exchange (%q)", s.exchangeType, s.exchangeName)
 	if err := channel.ExchangeDeclare(
-		serverInfo.exchangeName, // name
-		serverInfo.exchangeType, // type
-		true,                    // durable
-		false,                   // auto-deleted
-		false,                   // internal
-		false,                   // noWait
-		nil,                     // arguments
+		s.exchangeName, // name
+		s.exchangeType, // type
+		true,           // durable
+		false,          // auto-deleted
+		false,          // internal
+		false,          // noWait
+		nil,            // arguments
 	); err != nil {
+		connection.Close()
 		return fmt.Errorf("Exchange Declare: %s", err)
 	}
+	s.connection = connection
+	s.channel = channel
+	return nil
+}
 
-	var b *bytes.Buffer
+func (s *AMQPServer) ConnectWithRetries() {
 	for {
-		b = <-lineChan
-		//log.Printf("Publishing %s", string(b.Bytes()))
-		if err = channel.Publish(
-			serverInfo.exchangeName, // publish to an exchange
-			serverInfo.routingKey,   // routing to 0 or more queues
-			false,                   // mandatory
-			false,                   // immediate
-			amqp.Publishing{
-				Headers:         amqp.Table{},
-				ContentType:     "text/plain",
-				ContentEncoding: "",
-				Body:            b.Bytes(),
-				DeliveryMode:    amqp.Transient, // 1=non-persistent, 2=persistent
-				Priority:        0,              // 0-9
-			},
-		); err != nil {
-			lineChan <- b
-			return fmt.Errorf("Exchange Publish: %s", err)
+		err := s.Connect()
+		if err == nil {
+			return
 		}
+		log.Printf("Error connecting to AMQP: %s", err)
+		time.Sleep(10 * time.Second)
+	}
+}
 
+func (s *AMQPServer) ConnectIfNeeded() {
+	if s.connection == nil {
+		s.ConnectWithRetries()
+	}
+}
+func (s *AMQPServer) Close() {
+	if s.connection != nil {
+		s.connection.Close()
+	}
+}
+func (s *AMQPServer) Reconnect() {
+	s.Close()
+	s.ConnectWithRetries()
+}
+
+func (s *AMQPServer) Publish(rec []byte) error {
+	//log.Printf("Publishing %s", string(rec))
+	return s.channel.Publish(
+		s.exchangeName, // publish to an exchange
+		s.routingKey,   // routing to 0 or more queues
+		false,          // mandatory
+		false,          // immediate
+		amqp.Publishing{
+			Headers:         amqp.Table{},
+			ContentType:     "application/json",
+			ContentEncoding: "utf-8",
+			Body:            rec,
+			DeliveryMode:    amqp.Transient, // 1=non-persistent, 2=persistent
+			Priority:        0,              // 0-9
+		},
+	)
+}
+
+func (s *AMQPServer) PublishWithRetries(rec []byte) {
+	for {
+		s.ConnectIfNeeded()
+		err := s.Publish(rec)
+		if err == nil {
+			return
+		}
+		log.Printf("Exchange Publish: %s", err)
+		s.Reconnect()
+	}
+}
+
+func receive(lineChan chan *bytes.Buffer, serverConn AMQPServer) error {
+	var b *bytes.Buffer
+
+	for b = range lineChan {
+		serverConn.PublishWithRetries(b.Bytes())
 		if b.Cap() <= 1024*1024 {
 			b.Reset()
 			bufPool.Put(b)
 		}
 	}
+	serverConn.Close()
 	return nil
 }
 
 func main() {
 	var port int
 	var addr string
-	var serverInfo AMQPServer
-	flag.StringVar(&serverInfo.uri, "uri", "amqp://guest:guest@localhost:5672/", "AMQP URI")
-	flag.StringVar(&serverInfo.exchangeName, "exchange", "test-exchange", "Durable AMQP exchange name")
-	flag.StringVar(&serverInfo.exchangeType, "exchange-type", "direct", "Exchange type - direct|fanout|topic|x-custom")
-	flag.StringVar(&serverInfo.routingKey, "key", "test-key", "AMQP routing key")
+	var serverConn AMQPServer
+	flag.StringVar(&serverConn.uri, "uri", "amqp://guest:guest@localhost:5672/", "AMQP URI")
+	flag.StringVar(&serverConn.exchangeName, "exchange", "test-exchange", "Durable AMQP exchange name")
+	flag.StringVar(&serverConn.exchangeType, "exchange-type", "direct", "Exchange type - direct|fanout|topic|x-custom")
+	flag.StringVar(&serverConn.routingKey, "key", "test-key", "AMQP routing key")
 
 	flag.StringVar(&addr, "addr", "0.0.0.0", "Address to listen on")
 	flag.IntVar(&port, "port", 9000, "Port to listen on")
 	flag.Parse()
 
-	log.Printf("Publishing to %+v", serverInfo)
+	log.Printf("Publishing to %s", serverConn)
 	lineChan := make(chan *bytes.Buffer, 1000)
 	go listen(addr, port, lineChan)
 
 	for {
-		err := receive(lineChan, serverInfo)
+		err := receive(lineChan, serverConn)
 		if err != nil {
 			log.Printf("Error sending to amqp: %v", err)
 		}
