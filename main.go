@@ -142,6 +142,7 @@ func (s *AMQPServer) ConnectIfNeeded() {
 func (s *AMQPServer) Close() {
 	if s.connection != nil {
 		s.connection.Close()
+		s.connection = nil
 	}
 }
 func (s *AMQPServer) Reconnect() {
