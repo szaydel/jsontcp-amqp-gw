@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/streadway/amqp"
@@ -77,14 +80,16 @@ func handleLog(conn net.Conn, lineChan chan *bytes.Buffer) {
 }
 
 type AMQPServer struct {
-	uri          string
-	exchangeName string
-	exchangeType string
-	routingKey   string
-	reliable     bool
-	connection   *amqp.Connection
-	channel      *amqp.Channel
-	connected    bool
+	uri             string
+	exchangeName    string
+	exchangeType    string
+	routingKey      string
+	reliable        bool
+	connection      *amqp.Connection
+	channel         *amqp.Channel
+	connected       bool
+	notifyConnClose chan *amqp.Error
+	notifyChanClose chan *amqp.Error
 }
 
 func (s AMQPServer) String() string {
@@ -93,10 +98,15 @@ func (s AMQPServer) String() string {
 func (s *AMQPServer) Connect() error {
 	// This function dials, connects, declares,
 	log.Printf("dialing %q", s.uri)
-	connection, err := amqp.Dial(s.uri)
+	connection, err := amqp.DialConfig(s.uri,
+		amqp.Config{
+			Heartbeat: time.Second * 60, // broker will likely be lower
+		},
+	)
 	if err != nil {
 		return fmt.Errorf("Dial: %s", err)
 	}
+	connection.NotifyClose(s.notifyConnClose)
 
 	log.Printf("got Connection, getting Channel")
 	channel, err := connection.Channel()
@@ -104,6 +114,7 @@ func (s *AMQPServer) Connect() error {
 		connection.Close()
 		return fmt.Errorf("Channel: %s", err)
 	}
+	channel.NotifyClose(s.notifyChanClose)
 
 	log.Printf("got Channel, declaring %q Exchange (%q)", s.exchangeType, s.exchangeName)
 	if err := channel.ExchangeDeclare(
@@ -140,11 +151,16 @@ func (s *AMQPServer) ConnectIfNeeded() {
 	}
 }
 func (s *AMQPServer) Close() {
-	if s.connection != nil {
-		s.connection.Close()
-		s.connection = nil
+	if s.connection == nil {
+		return
 	}
+	if err := s.connection.Close(); err != nil {
+		log.Printf("Error closing connection to AMQP: %v", err)
+		return
+	}
+	s.connection = nil
 }
+
 func (s *AMQPServer) Reconnect() {
 	s.Close()
 	s.ConnectWithRetries()
@@ -207,9 +223,24 @@ func main() {
 	flag.IntVar(&port, "port", 9000, "Port to listen on")
 	flag.Parse()
 
+	// Setup signals and shutdown channel
+	var (
+		stop    chan struct{}  // Channel to stop/close server and exit
+		sighup  chan struct{}  // Channel to trigger reconnect on SIGHUP
+		signals chan os.Signal // OS signals arrive on this channel
+	)
+	signals = make(chan os.Signal, 1)
+	stop = make(chan struct{})
+	sighup = make(chan struct{})
+	signal.Notify(signals)
+	go signalWatch(signals, stop, sighup)
+
 	log.Printf("Publishing to %s", serverConn)
 	lineChan := make(chan *bytes.Buffer, 1000)
 	go listen(addr, port, lineChan)
+
+	// Setup handling of events like close notifications from broker or signals.
+	go eventHandler(&serverConn, stop, sighup)
 
 	for {
 		err := receive(lineChan, serverConn)
@@ -218,5 +249,39 @@ func main() {
 		}
 		time.Sleep(5 * time.Second)
 	}
+}
 
+func eventHandler(serverConn *AMQPServer, stop, sighup chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			log.Printf("Received shutdown signal; gateway shutting down...")
+			serverConn.Close() // This should flush any buffers
+			os.Exit(0)
+		case <-sighup:
+			log.Printf("Received SIGHUP signal; asking server to reconnect")
+			serverConn.Reconnect()
+		case msg := <-serverConn.notifyChanClose:
+			log.Printf("Channel Close Notification: %v", msg)
+		case msg := <-serverConn.notifyConnClose:
+			log.Printf("Connection Close Notification: %v", msg)
+			serverConn.Reconnect()
+		default:
+			time.Sleep(2 * time.Second) // At most shutdown should take 2 secs
+		}
+	}
+}
+
+func signalWatch(signals chan os.Signal, stop, sighup chan struct{}) {
+	for {
+		s := <-signals
+		switch s {
+		case syscall.SIGTERM, syscall.SIGINT:
+			stop <- struct{}{}
+		case syscall.SIGHUP:
+			sighup <- struct{}{}
+		default:
+			log.Printf("Caught signal: %v\n", s)
+		}
+	}
 }
