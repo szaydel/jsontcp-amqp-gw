@@ -98,6 +98,16 @@ func (s AMQPServer) String() string {
 	return fmt.Sprintf("uri=%s exchange=%s routingKey=%s", s.uri, s.exchangeName, s.routingKey)
 }
 func (s *AMQPServer) Connect() error {
+	if s.notifyConnClose != nil {
+		close(s.notifyConnClose)
+		s.notifyConnClose = nil
+	}
+	s.notifyConnClose = make(chan *amqp.Error)
+	if s.notifyChanClose != nil {
+		close(s.notifyChanClose)
+		s.notifyChanClose = nil
+	}
+	s.notifyChanClose = make(chan *amqp.Error)
 	// This function dials, connects, declares,
 	log.Printf("dialing %q", s.uri)
 	connection, err := amqp.DialConfig(s.uri,
@@ -158,23 +168,11 @@ func (s *AMQPServer) Close() {
 		log.Printf("Connection to AMQP already closed")
 		return
 	}
-	// If we experience an error closing channel we do not close and set to nil
-	// s.connection.
-	if s.channel != nil {
-		if err := s.channel.Close(); err != nil {
-			log.Printf("Error closing channel to AMQP: %v", err)
-			return
-		}
-		s.channel = nil
+	if err := s.connection.Close(); err != nil {
+		log.Printf("Error closing connection to AMQP: %v", err)
+		return
 	}
-	if s.connection != nil {
-		if err := s.connection.Close(); err != nil {
-			log.Printf("Error closing connection to AMQP: %v", err)
-			return
-		}
-		s.connection = nil
-	}
-
+	s.connection = nil
 }
 
 func (s *AMQPServer) Reconnect() {
