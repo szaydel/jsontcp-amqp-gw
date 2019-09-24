@@ -98,15 +98,7 @@ func (s AMQPServer) String() string {
 	return fmt.Sprintf("uri=%s exchange=%s routingKey=%s", s.uri, s.exchangeName, s.routingKey)
 }
 func (s *AMQPServer) Connect() error {
-	if s.notifyConnClose != nil {
-		close(s.notifyConnClose)
-		s.notifyConnClose = nil
-	}
 	s.notifyConnClose = make(chan *amqp.Error)
-	if s.notifyChanClose != nil {
-		close(s.notifyChanClose)
-		s.notifyChanClose = nil
-	}
 	s.notifyChanClose = make(chan *amqp.Error)
 	// This function dials, connects, declares,
 	log.Printf("dialing %q", s.uri)
