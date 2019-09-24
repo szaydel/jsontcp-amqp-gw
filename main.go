@@ -80,14 +80,16 @@ func handleLog(conn net.Conn, lineChan chan *bytes.Buffer) {
 }
 
 type AMQPServer struct {
-	uri             string
-	exchangeName    string
-	exchangeType    string
-	routingKey      string
-	reliable        bool
-	connection      *amqp.Connection
-	channel         *amqp.Channel
-	connected       bool
+	uri          string
+	exchangeName string
+	exchangeType string
+	routingKey   string
+	heartbeat    time.Duration
+	reliable     bool
+	connection   *amqp.Connection
+	channel      *amqp.Channel
+	connected    bool
+
 	notifyConnClose chan *amqp.Error
 	notifyChanClose chan *amqp.Error
 }
@@ -100,7 +102,7 @@ func (s *AMQPServer) Connect() error {
 	log.Printf("dialing %q", s.uri)
 	connection, err := amqp.DialConfig(s.uri,
 		amqp.Config{
-			Heartbeat: time.Second * 60, // broker will likely be lower
+			Heartbeat: s.heartbeat, // broker will likely be lower
 		},
 	)
 	if err != nil {
@@ -112,7 +114,7 @@ func (s *AMQPServer) Connect() error {
 	channel, err := connection.Channel()
 	if err != nil {
 		connection.Close()
-		return fmt.Errorf("Channel: %s", err)
+		return fmt.Errorf("Error getting channel: %s", err)
 	}
 	channel.NotifyClose(s.notifyChanClose)
 
@@ -151,9 +153,18 @@ func (s *AMQPServer) ConnectIfNeeded() {
 	}
 }
 func (s *AMQPServer) Close() {
+	log.Printf("Attempting to close connection to AMQP")
 	if s.connection == nil {
+		log.Printf("Connection to AMQP already closed")
 		return
 	}
+	// If we experience an error closing channel we do not close and set to nil
+	// s.connection.
+	if err := s.channel.Close(); err != nil {
+		log.Printf("Error closing channel to AMQP: %v", err)
+		return
+	}
+	s.channel = nil
 	if err := s.connection.Close(); err != nil {
 		log.Printf("Error closing connection to AMQP: %v", err)
 		return
@@ -162,6 +173,7 @@ func (s *AMQPServer) Close() {
 }
 
 func (s *AMQPServer) Reconnect() {
+	log.Printf("Reconnecting to AMQP server")
 	s.Close()
 	s.ConnectWithRetries()
 }
@@ -187,11 +199,13 @@ func (s *AMQPServer) Publish(rec []byte) error {
 func (s *AMQPServer) PublishWithRetries(rec []byte) {
 	for {
 		s.ConnectIfNeeded()
+		log.Printf("Begin Exchange Publish %d bytes", len(rec))
 		err := s.Publish(rec)
 		if err == nil {
+			log.Printf("Finish Exchange Publish %d bytes", len(rec))
 			return
 		}
-		log.Printf("Exchange Publish: %s", err)
+		log.Printf("Failed Exchange Publish: %s", err)
 		s.Reconnect()
 	}
 }
@@ -206,6 +220,7 @@ func receive(lineChan chan *bytes.Buffer, serverConn AMQPServer) error {
 			bufPool.Put(b)
 		}
 	}
+	log.Printf("Finish ranging over lineChan, closing server connection")
 	serverConn.Close()
 	return nil
 }
@@ -218,7 +233,7 @@ func main() {
 	flag.StringVar(&serverConn.exchangeName, "exchange", "test-exchange", "Durable AMQP exchange name")
 	flag.StringVar(&serverConn.exchangeType, "exchange-type", "direct", "Exchange type - direct|fanout|topic|x-custom")
 	flag.StringVar(&serverConn.routingKey, "key", "test-key", "AMQP routing key")
-
+	flag.DurationVar(&serverConn.heartbeat, "heartbeat interval", 60*time.Second, "Time in seconds to set liveness heartbeat to")
 	flag.StringVar(&addr, "addr", "0.0.0.0", "Address to listen on")
 	flag.IntVar(&port, "port", 9000, "Port to listen on")
 	flag.Parse()
@@ -245,7 +260,7 @@ func main() {
 	for {
 		err := receive(lineChan, serverConn)
 		if err != nil {
-			log.Printf("Error sending to amqp: %v", err)
+			log.Printf("Error sending to AMQP: %v", err)
 		}
 		time.Sleep(5 * time.Second)
 	}
