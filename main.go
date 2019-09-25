@@ -86,20 +86,19 @@ type AMQPServer struct {
 	routingKey   string
 	heartbeat    time.Duration
 	reliable     bool
+	confirm      bool
 	connection   *amqp.Connection
 	channel      *amqp.Channel
-	connected    bool
 
 	notifyConnClose chan *amqp.Error
 	notifyChanClose chan *amqp.Error
+	notifyConfirm   chan amqp.Confirmation
 }
 
 func (s AMQPServer) String() string {
 	return fmt.Sprintf("uri=%s exchange=%s routingKey=%s", s.uri, s.exchangeName, s.routingKey)
 }
 func (s *AMQPServer) Connect() error {
-	s.notifyConnClose = make(chan *amqp.Error)
-	s.notifyChanClose = make(chan *amqp.Error)
 	// This function dials, connects, declares,
 	log.Printf("dialing %q", s.uri)
 	connection, err := amqp.DialConfig(s.uri,
@@ -110,15 +109,12 @@ func (s *AMQPServer) Connect() error {
 	if err != nil {
 		return fmt.Errorf("Dial: %s", err)
 	}
-	connection.NotifyClose(s.notifyConnClose)
-
 	log.Printf("got Connection, getting Channel")
 	channel, err := connection.Channel()
 	if err != nil {
 		connection.Close()
 		return fmt.Errorf("Error getting channel: %s", err)
 	}
-	channel.NotifyClose(s.notifyChanClose)
 
 	log.Printf("got Channel, declaring %q Exchange (%q)", s.exchangeType, s.exchangeName)
 	if err := channel.ExchangeDeclare(
@@ -132,6 +128,17 @@ func (s *AMQPServer) Connect() error {
 	); err != nil {
 		connection.Close()
 		return fmt.Errorf("Exchange Declare: %s", err)
+	}
+
+	s.notifyConnClose = make(chan *amqp.Error)
+	s.notifyChanClose = make(chan *amqp.Error)
+
+	connection.NotifyClose(s.notifyConnClose)
+	channel.NotifyClose(s.notifyChanClose)
+	if s.confirm {
+		s.notifyConfirm = make(chan amqp.Confirmation, 1)
+		channel.NotifyPublish(s.notifyConfirm)
+		channel.Confirm(false) // false here implies noWait = false
 	}
 	s.connection = connection
 	s.channel = channel
@@ -155,9 +162,7 @@ func (s *AMQPServer) ConnectIfNeeded() {
 	}
 }
 func (s *AMQPServer) Close() {
-	log.Printf("Attempting to close connection to AMQP")
 	if s.connection == nil {
-		log.Printf("Connection to AMQP already closed")
 		return
 	}
 	if err := s.connection.Close(); err != nil {
@@ -194,14 +199,23 @@ func (s *AMQPServer) Publish(rec []byte) error {
 func (s *AMQPServer) PublishWithRetries(rec []byte) {
 	for {
 		s.ConnectIfNeeded()
-		log.Printf("Begin Exchange Publish %d bytes", len(rec))
-		err := s.Publish(rec)
-		if err == nil {
-			log.Printf("Finish Exchange Publish %d bytes", len(rec))
+		log.Printf("Begin Exchange publish %d bytes", len(rec))
+		if err := s.Publish(rec); err != nil {
+			log.Printf("Error publishing %d bytes to Exchange: %v", len(rec), err)
+		}
+		if !s.confirm {
 			return
 		}
-		log.Printf("Failed Exchange Publish: %s", err)
-		s.Reconnect()
+		// select here is only for cases where reliable delivery is used.
+		select {
+		case confirm := <-s.notifyConfirm:
+			if confirm.Ack {
+				log.Printf("Confirmed Exchange publish %d bytes %v", len(rec), confirm)
+				return
+			}
+		case <-time.After(1 * time.Second):
+			// this just delays the loop by 1 second on retries
+		}
 	}
 }
 
@@ -215,9 +229,7 @@ func receive(lineChan chan *bytes.Buffer, serverConn AMQPServer) error {
 			bufPool.Put(b)
 		}
 	}
-	log.Printf("Finish ranging over lineChan, closing server connection")
-	serverConn.Close()
-	return nil
+	return nil // never reached
 }
 
 func main() {
@@ -228,7 +240,8 @@ func main() {
 	flag.StringVar(&serverConn.exchangeName, "exchange", "test-exchange", "Durable AMQP exchange name")
 	flag.StringVar(&serverConn.exchangeType, "exchange-type", "direct", "Exchange type - direct|fanout|topic|x-custom")
 	flag.StringVar(&serverConn.routingKey, "key", "test-key", "AMQP routing key")
-	flag.DurationVar(&serverConn.heartbeat, "heartbeat interval", 60*time.Second, "Time in seconds to set liveness heartbeat to")
+	flag.DurationVar(&serverConn.heartbeat, "heartbeat interval", 60*time.Second, "Time in seconds to set heartbeat timeout to")
+	flag.BoolVar(&serverConn.confirm, "confirm", false, "Should each message be confirmed?")
 	flag.StringVar(&addr, "addr", "0.0.0.0", "Address to listen on")
 	flag.IntVar(&port, "port", 9000, "Port to listen on")
 	flag.Parse()
