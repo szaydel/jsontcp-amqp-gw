@@ -88,6 +88,7 @@ type AMQPServer struct {
 	reliable     bool
 	confirm      bool
 	interval     int64
+	verbose      bool
 	connection   *amqp.Connection
 	channel      *amqp.Channel
 
@@ -198,14 +199,20 @@ func (s *AMQPServer) Publish(rec []byte) error {
 }
 
 func (s *AMQPServer) PublishWithRetries(rec []byte) {
+top:
 	for {
 		s.ConnectIfNeeded()
-		log.Printf("Begin Exchange publish %d bytes", len(rec))
+		if s.verbose {
+			log.Printf("Begin Exchange publish %d bytes", len(rec))
+		}
 		if err := s.Publish(rec); err != nil {
 			if v, ok := err.(*amqp.Error); ok {
 				log.Printf("Publishing %d bytes to Exchange: %s, reconnecting...", len(rec), v.Reason)
 			}
+			// In the case of error we want to reconnect and go to the
+			// top of the for loop to repeat this process again.
 			s.Reconnect()
+			continue
 		}
 		if !s.confirm {
 			return
@@ -214,11 +221,16 @@ func (s *AMQPServer) PublishWithRetries(rec []byte) {
 		select {
 		case confirm := <-s.notifyConfirm:
 			if confirm.Ack {
-				log.Printf("Confirmed Exchange publish %d bytes %v", len(rec), confirm)
+				if s.verbose {
+					log.Printf("Confirmed Exchange publish %d bytes %v", len(rec), confirm)
+				}
 				return
+			} else {
+				break top // Repeat the loop if negative ack received
 			}
 		case <-time.After(1 * time.Second):
 			// this just delays the loop by 1 second on retries
+			s.Reconnect()
 		}
 	}
 }
@@ -270,6 +282,7 @@ func main() {
 	flag.StringVar(&addr, "addr", "0.0.0.0", "Address to listen on")
 	flag.IntVar(&port, "port", 9000, "Port to listen on")
 	flag.Int64Var(&serverConn.interval, "stats-interval", 100, "Interval in number of messages between reporting stats")
+	flag.BoolVar(&serverConn.verbose, "verbose", false, "Enable informational messages")
 	flag.Parse()
 
 	// Setup signals and shutdown channel
@@ -285,7 +298,7 @@ func main() {
 	go signalWatch(signals, stop, sighup)
 
 	log.Printf("Publishing to %s", serverConn)
-	lineChan := make(chan *bytes.Buffer, 1000)
+	lineChan := make(chan *bytes.Buffer)
 	go listen(addr, port, lineChan)
 
 	// Setup handling of events like close notifications from broker or signals.
