@@ -87,6 +87,7 @@ type AMQPServer struct {
 	heartbeat    time.Duration
 	reliable     bool
 	confirm      bool
+	interval     int64
 	connection   *amqp.Connection
 	channel      *amqp.Channel
 
@@ -201,7 +202,10 @@ func (s *AMQPServer) PublishWithRetries(rec []byte) {
 		s.ConnectIfNeeded()
 		log.Printf("Begin Exchange publish %d bytes", len(rec))
 		if err := s.Publish(rec); err != nil {
-			log.Printf("Error publishing %d bytes to Exchange: %v", len(rec), err)
+			if v, ok := err.(*amqp.Error); ok {
+				log.Printf("Publishing %d bytes to Exchange: %s, reconnecting...", len(rec), v.Reason)
+			}
+			s.Reconnect()
 		}
 		if !s.confirm {
 			return
@@ -221,15 +225,36 @@ func (s *AMQPServer) PublishWithRetries(rec []byte) {
 
 func receive(lineChan chan *bytes.Buffer, serverConn AMQPServer) error {
 	var b *bytes.Buffer
+	var counter int64
+	var delta, av, max, total time.Duration
 
 	for b = range lineChan {
-		serverConn.PublishWithRetries(b.Bytes())
+		delta = timeit(serverConn.PublishWithRetries, b.Bytes())
+		counter++
+		total += delta
+		if max < delta {
+			max = delta
+		}
+		av = time.Duration(total.Nanoseconds() / counter)
+		// serverConn.PublishWithRetries(b.Bytes())
 		if b.Cap() <= 1024*1024 {
 			b.Reset()
 			bufPool.Put(b)
 		}
+		if counter%serverConn.interval == 0 {
+			log.Printf("Messages: %d Mean: %v Interval Max: %v ",
+				counter, av, max)
+			max = 0
+		}
 	}
 	return nil // never reached
+}
+
+func timeit(f func(rec []byte), rec []byte) time.Duration {
+	start := time.Now()
+	f(rec)
+	return time.Now().Sub(start)
+
 }
 
 func main() {
@@ -244,6 +269,7 @@ func main() {
 	flag.BoolVar(&serverConn.confirm, "confirm", false, "Should each message be confirmed?")
 	flag.StringVar(&addr, "addr", "0.0.0.0", "Address to listen on")
 	flag.IntVar(&port, "port", 9000, "Port to listen on")
+	flag.Int64Var(&serverConn.interval, "stats-interval", 100, "Interval in number of messages between reporting stats")
 	flag.Parse()
 
 	// Setup signals and shutdown channel
