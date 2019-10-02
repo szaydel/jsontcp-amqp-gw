@@ -226,6 +226,7 @@ top:
 				}
 				return
 			} else {
+				log.Printf("Publish to exchange failed!")
 				break top // Repeat the loop if negative ack received
 			}
 		case <-time.After(1 * time.Second):
