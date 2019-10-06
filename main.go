@@ -40,7 +40,7 @@ func enableKeepAlive(conn net.Conn) error {
 	return nil
 }
 
-func listen(addr string, port int, lineChan chan *bytes.Buffer) {
+func listen(addr string, port int, lineChan chan *bytes.Buffer, tpsChan chan *TputStats) {
 	bind := fmt.Sprintf("%s:%d", addr, port)
 	log.Printf("Listening on %s", bind)
 	l, err := net.Listen("tcp", bind)
@@ -57,11 +57,42 @@ func listen(addr string, port int, lineChan chan *bytes.Buffer) {
 		if err := enableKeepAlive(conn); err != nil {
 			log.Fatalf("Error enabling keepalive: %v", err)
 		}
-		go handleLog(conn, lineChan)
+		go handleLog(conn, lineChan, tpsChan)
 	}
 }
 
-func handleLog(conn net.Conn, lineChan chan *bytes.Buffer) {
+type TputStats struct {
+	prev, current, total    int64
+	timestamp, lastReported time.Time
+	rate                    float64
+	clientInfo              net.Addr
+}
+
+func ComputeTputStats(s *AMQPServer, tpsChan chan *TputStats) {
+	var timeDelta time.Duration
+	var now time.Time
+	var prev, current int64
+	var bytesDelta float64
+	for v := range tpsChan {
+		now = time.Now()
+		timeDelta = now.Sub(v.timestamp)
+		prev = v.prev
+		current = v.current
+
+		bytesDelta = float64(current - prev)
+		v.rate = bytesDelta / timeDelta.Seconds()
+		v.timestamp = now
+		v.prev = current
+		if v.lastReported.Add(s.interval).Before(now) {
+			log.Printf("Remote (%v): %.3f KBytes/sec",
+				v.clientInfo, v.rate/1024.0)
+			v.lastReported = now
+		}
+	}
+}
+
+func handleLog(conn net.Conn, lineChan chan *bytes.Buffer, tpsChan chan *TputStats) {
+	tps := &TputStats{clientInfo: conn.RemoteAddr()}
 	defer conn.Close()
 	scanner := bufio.NewScanner(conn)
 	buf := make([]byte, 0, bufferSize)
@@ -71,6 +102,8 @@ func handleLog(conn net.Conn, lineChan chan *bytes.Buffer) {
 		outbuf := bufPool.Get().(*bytes.Buffer)
 		outbuf.Write(buf)
 		lineChan <- outbuf
+		tps.current += int64(len(scanner.Bytes()))
+		tpsChan <- tps
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -85,9 +118,9 @@ type AMQPServer struct {
 	exchangeType string
 	routingKey   string
 	heartbeat    time.Duration
+	interval     time.Duration
 	reliable     bool
 	confirm      bool
-	interval     int64
 	verbose      bool
 	connection   *amqp.Connection
 	channel      *amqp.Channel
@@ -238,26 +271,32 @@ top:
 
 func receive(lineChan chan *bytes.Buffer, serverConn AMQPServer) error {
 	var b *bytes.Buffer
-	var counter int64
-	var delta, av, max, total time.Duration
+	var prev, current int64
+	var lastReported, now time.Time
+	var callDuration, avDuration, maxDuration, totalDuration time.Duration
+	var rate float64
 
 	for b = range lineChan {
-		delta = timeit(serverConn.PublishWithRetries, b.Bytes())
-		counter++
-		total += delta
-		if max < delta {
-			max = delta
+		callDuration = timeit(serverConn.PublishWithRetries, b.Bytes())
+		current++
+		totalDuration += callDuration
+		if maxDuration < callDuration {
+			maxDuration = callDuration
 		}
-		av = time.Duration(total.Nanoseconds() / counter)
-		// serverConn.PublishWithRetries(b.Bytes())
+		avDuration = time.Duration(totalDuration.Nanoseconds() / current)
 		if b.Cap() <= 1024*1024 {
 			b.Reset()
 			bufPool.Put(b)
 		}
-		if counter%serverConn.interval == 0 {
-			log.Printf("Messages: %d Mean: %v Interval Max: %v ",
-				counter, av, max)
-			max = 0
+
+		now = time.Now()
+		rate = float64(current-prev) / now.Sub(lastReported).Seconds()
+		if lastReported.Add(serverConn.interval).Before(now) {
+			log.Printf("Messages: %d (%.3f/sec) Avg Latency: %v Max Interval Latency: %v",
+				current-prev, rate, avDuration, maxDuration)
+			lastReported = now
+			prev = current
+			maxDuration = 0
 		}
 	}
 	return nil // never reached
@@ -282,7 +321,7 @@ func main() {
 	flag.BoolVar(&serverConn.confirm, "confirm", false, "Should each message be confirmed?")
 	flag.StringVar(&addr, "addr", "0.0.0.0", "Address to listen on")
 	flag.IntVar(&port, "port", 9000, "Port to listen on")
-	flag.Int64Var(&serverConn.interval, "stats-interval", 100, "Interval in number of messages between reporting stats")
+	flag.DurationVar(&serverConn.interval, "stats-interval", 60*time.Second, "Report running statistics with given interval")
 	flag.BoolVar(&serverConn.verbose, "verbose", false, "Enable informational messages")
 	flag.Parse()
 
@@ -298,9 +337,13 @@ func main() {
 	signal.Notify(signals)
 	go signalWatch(signals, stop, sighup)
 
+	// Throughput stats for server
+	tpsChan := make(chan *TputStats)
+	go ComputeTputStats(&serverConn, tpsChan)
+
 	log.Printf("Publishing to %s", serverConn)
 	lineChan := make(chan *bytes.Buffer)
-	go listen(addr, port, lineChan)
+	go listen(addr, port, lineChan, tpsChan)
 
 	// Setup handling of events like close notifications from broker or signals.
 	go eventHandler(&serverConn, stop, sighup)
