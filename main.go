@@ -84,7 +84,7 @@ func ComputeTputStats(s *AMQPServer, tpsChan chan *TputStats) {
 		v.timestamp = now
 		v.prev = current
 		if v.lastReported.Add(s.interval).Before(now) {
-			log.Printf("Remote (%v): %.3f KBytes/sec",
+			log.Printf("Sensor (%v) throughput: %.3f KBytes/sec",
 				v.clientInfo, v.rate/1024.0)
 			v.lastReported = now
 		}
@@ -122,6 +122,7 @@ type AMQPServer struct {
 	reliable     bool
 	confirm      bool
 	verbose      bool
+	mockPublish  bool
 	connection   *amqp.Connection
 	channel      *amqp.Channel
 
@@ -232,6 +233,12 @@ func (s *AMQPServer) Publish(rec []byte) error {
 }
 
 func (s *AMQPServer) PublishWithRetries(rec []byte) {
+	if s.mockPublish {
+		if s.verbose {
+			log.Println("Simulated exchange publish %d bytes", len(rec))
+		}
+		return
+	}
 top:
 	for {
 		s.ConnectIfNeeded()
@@ -292,7 +299,7 @@ func receive(lineChan chan *bytes.Buffer, serverConn AMQPServer) error {
 		now = time.Now()
 		rate = float64(current-prev) / now.Sub(lastReported).Seconds()
 		if lastReported.Add(serverConn.interval).Before(now) {
-			log.Printf("Messages: %d (%.3f/sec) Avg Latency: %v Max Interval Latency: %v",
+			log.Printf("Published msgs: %d (%.3f published/sec) Avg Latency: %v Max Latency: %v",
 				current-prev, rate, avDuration, maxDuration)
 			lastReported = now
 			prev = current
@@ -306,7 +313,6 @@ func timeit(f func(rec []byte), rec []byte) time.Duration {
 	start := time.Now()
 	f(rec)
 	return time.Now().Sub(start)
-
 }
 
 func main() {
@@ -323,6 +329,7 @@ func main() {
 	flag.IntVar(&port, "port", 9000, "Port to listen on")
 	flag.DurationVar(&serverConn.interval, "stats-interval", 60*time.Second, "Report running statistics with given interval")
 	flag.BoolVar(&serverConn.verbose, "verbose", false, "Enable informational messages")
+	flag.BoolVar(&serverConn.mockPublish, "mock-publish", false, "Only pretend to publish to AMQP; useful to measure performance of gateway itself")
 	flag.Parse()
 
 	// Setup signals and shutdown channel
