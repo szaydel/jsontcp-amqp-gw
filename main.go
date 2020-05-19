@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -114,6 +115,7 @@ func handleLog(conn net.Conn, lineChan chan *bytes.Buffer, tpsChan chan *TputSta
 
 type AMQPServer struct {
 	uri          string
+	uriIndex     int
 	exchangeName string
 	exchangeType string
 	routingKey   string
@@ -136,8 +138,11 @@ func (s AMQPServer) String() string {
 }
 func (s *AMQPServer) Connect() error {
 	// This function dials, connects, declares,
-	log.Printf("dialing %q", s.uri)
-	connection, err := amqp.DialConfig(s.uri,
+	uris := strings.Split(s.uri, ",")
+	uri := uris[s.uriIndex]
+	s.uriIndex = (s.uriIndex + 1) % len(uris)
+	log.Printf("dialing %q", uri)
+	connection, err := amqp.DialConfig(uri,
 		amqp.Config{
 			Heartbeat: s.heartbeat, // broker will likely be lower
 		},
@@ -319,7 +324,7 @@ func main() {
 	var port int
 	var addr string
 	var serverConn AMQPServer
-	flag.StringVar(&serverConn.uri, "uri", "amqp://guest:guest@localhost:5672/", "AMQP URI")
+	flag.StringVar(&serverConn.uri, "uri", "amqp://guest:guest@localhost:5672/", "Comma separated AMQP URIs")
 	flag.StringVar(&serverConn.exchangeName, "exchange", "test-exchange", "Durable AMQP exchange name")
 	flag.StringVar(&serverConn.exchangeType, "exchange-type", "direct", "Exchange type - direct|fanout|topic|x-custom")
 	flag.StringVar(&serverConn.routingKey, "key", "test-key", "AMQP routing key")
