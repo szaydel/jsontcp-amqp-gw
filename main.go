@@ -328,7 +328,7 @@ func main() {
 	flag.StringVar(&serverConn.exchangeName, "exchange", "test-exchange", "Durable AMQP exchange name")
 	flag.StringVar(&serverConn.exchangeType, "exchange-type", "direct", "Exchange type - direct|fanout|topic|x-custom")
 	flag.StringVar(&serverConn.routingKey, "key", "test-key", "AMQP routing key")
-	flag.DurationVar(&serverConn.heartbeat, "heartbeat interval", 60*time.Second, "Time in seconds to set heartbeat timeout to")
+	flag.DurationVar(&serverConn.heartbeat, "heartbeat-interval", 60*time.Second, "Time in seconds to set heartbeat timeout to")
 	flag.BoolVar(&serverConn.confirm, "confirm", false, "Should each message be confirmed?")
 	flag.StringVar(&addr, "addr", "0.0.0.0", "Address to listen on")
 	flag.IntVar(&port, "port", 9000, "Port to listen on")
